@@ -1,16 +1,16 @@
 #include <inttypes.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 
 /*
  * fpvm_threaded.c
  * نسخة C مبسطة من مفسر PhantomVM باستخدام:
- * 1) Computed Goto (بدون switch-case في حلقة التنفيذ)
- * 2) Direct Threaded Code (جدول عناوين handlers داخل stream)
+ * - Computed Goto في التنفيذ
+ * - Direct Threaded Code (stream يحتوي عناوين handlers)
  *
- * ملاحظة: يعتمد على امتداد GNU C (labels as values).
+ * Requires GNU C extension: labels-as-values.
  */
 
 enum {
@@ -41,16 +41,38 @@ typedef struct {
   uint32_t regs[256];
   uint32_t stack[1024];
   uint32_t sp;
-  int32_t cmp_flag; /* 0 = equal, >0 = greater, <0 = less */
+  int32_t cmp_flag; /* 0=equal, >0=greater, <0=less */
 } FPVM;
 
 typedef struct {
   uintptr_t *cells;
   size_t len;
   size_t cap;
-} ThreadedProgram;
+} CellProgram;
 
-static uint32_t rd_u32(const uint8_t *code, size_t *pc, size_t n) {
+static void cp_push(CellProgram *cp, uintptr_t v) {
+  if (cp->len == cp->cap) {
+    size_t next_cap = cp->cap ? cp->cap * 2 : 128;
+    uintptr_t *new_cells = (uintptr_t *)realloc(cp->cells, next_cap * sizeof(uintptr_t));
+    if (!new_cells) {
+      fprintf(stderr, "out of memory\n");
+      exit(1);
+    }
+    cp->cells = new_cells;
+    cp->cap = next_cap;
+  }
+  cp->cells[cp->len++] = v;
+}
+
+static uint8_t read_u8(const uint8_t *code, size_t *pc, size_t n) {
+  if (*pc >= n) {
+    fprintf(stderr, "bytecode truncated near pc=%zu\n", *pc);
+    exit(1);
+  }
+  return code[(*pc)++];
+}
+
+static uint32_t read_u32(const uint8_t *code, size_t *pc, size_t n) {
   if (*pc + 4 > n) {
     fprintf(stderr, "bytecode truncated near pc=%zu\n", *pc);
     exit(1);
@@ -64,179 +86,253 @@ static uint32_t rd_u32(const uint8_t *code, size_t *pc, size_t n) {
   return v;
 }
 
-static uint8_t rd_u8(const uint8_t *code, size_t *pc, size_t n) {
-  if (*pc >= n) {
-    fprintf(stderr, "bytecode truncated near pc=%zu\n", *pc);
+static size_t insn_size(uint8_t op) {
+  switch (op) {
+    case OP_HLT:
+    case OP_POP:
+    case OP_DUP:
+      return 1;
+
+    case OP_PUSH_R:
+    case OP_POP_R:
+      return 2;
+
+    case OP_PUSH_N:
+    case OP_JMP_N:
+    case OP_JEQ_N:
+    case OP_JNE_N:
+      return 5;
+
+    case OP_MOV_R_N:
+    case OP_ADD_R_N:
+    case OP_SUB_R_N:
+    case OP_MUL_R_N:
+    case OP_DIV_R_N:
+    case OP_CMP_R_N:
+      return 6;
+
+    case OP_MOV_R_R:
+    case OP_ADD_R_R:
+    case OP_SUB_R_R:
+    case OP_MUL_R_R:
+    case OP_DIV_R_R:
+    case OP_CMP_R_R:
+      return 3;
+
+    default:
+      return 0;
+  }
+}
+
+static CellProgram compile_to_direct_threaded(const uint8_t *code, size_t n, void **dispatch_table) {
+  CellProgram cp = {0};
+
+  uint32_t *byte_to_cell = (uint32_t *)malloc((n + 1) * sizeof(uint32_t));
+  if (!byte_to_cell) {
+    fprintf(stderr, "out of memory\n");
     exit(1);
   }
-  return code[(*pc)++];
-}
+  for (size_t i = 0; i <= n; i++) byte_to_cell[i] = UINT32_MAX;
 
-static void tp_push(ThreadedProgram *tp, uintptr_t cell) {
-  if (tp->len == tp->cap) {
-    size_t next = tp->cap ? tp->cap * 2 : 128;
-    uintptr_t *grown = (uintptr_t *)realloc(tp->cells, next * sizeof(uintptr_t));
-    if (!grown) {
-      fprintf(stderr, "out of memory\n");
+  /* Pass 1: map كل bytecode pc إلى cell-index بداية التعليمة */
+  size_t pc = 0;
+  uint32_t cell_count = 0;
+  while (pc < n) {
+    uint8_t op = code[pc];
+    size_t sz = insn_size(op);
+    if (sz == 0 || pc + sz > n) {
+      fprintf(stderr, "unsupported/truncated opcode 0x%02X at byte pc=%zu\n", op, pc);
+      free(byte_to_cell);
       exit(1);
     }
-    tp->cells = grown;
-    tp->cap = next;
-  }
-  tp->cells[tp->len++] = cell;
-}
+    byte_to_cell[pc] = cell_count;
 
-static ThreadedProgram thread_bytecode(const uint8_t *code, size_t n) {
-  ThreadedProgram tp = {0};
-  size_t pc = 0;
-
-#define LABEL(l) ((uintptr_t)&&l)
-
-  while (pc < n) {
-    uint8_t op = rd_u8(code, &pc, n);
+    /* handler cell + operand cells */
     switch (op) {
       case OP_HLT:
-        tp_push(&tp, LABEL(L_HLT));
-        break;
-
-      case OP_PUSH_N:
-        tp_push(&tp, LABEL(L_PUSH_N));
-        tp_push(&tp, (uintptr_t)rd_u32(code, &pc, n));
-        break;
-
-      case OP_PUSH_R:
-        tp_push(&tp, LABEL(L_PUSH_R));
-        tp_push(&tp, (uintptr_t)rd_u8(code, &pc, n));
-        break;
-
       case OP_POP:
-        tp_push(&tp, LABEL(L_POP));
-        break;
-
-      case OP_POP_R:
-        tp_push(&tp, LABEL(L_POP_R));
-        tp_push(&tp, (uintptr_t)rd_u8(code, &pc, n));
-        break;
-
       case OP_DUP:
-        tp_push(&tp, LABEL(L_DUP));
+        cell_count += 1;
         break;
-
-      case OP_MOV_R_N:
-        tp_push(&tp, LABEL(L_MOV_R_N));
-        tp_push(&tp, (uintptr_t)rd_u8(code, &pc, n));
-        tp_push(&tp, (uintptr_t)rd_u32(code, &pc, n));
+      case OP_PUSH_R:
+      case OP_POP_R:
+        cell_count += 2;
         break;
-
+      case OP_PUSH_N:
+      case OP_JMP_N:
+      case OP_JEQ_N:
+      case OP_JNE_N:
+        cell_count += 2;
+        break;
       case OP_MOV_R_R:
-        tp_push(&tp, LABEL(L_MOV_R_R));
-        tp_push(&tp, (uintptr_t)rd_u8(code, &pc, n));
-        tp_push(&tp, (uintptr_t)rd_u8(code, &pc, n));
-        break;
-
-      case OP_ADD_R_N:
-      case OP_SUB_R_N:
-      case OP_MUL_R_N:
-      case OP_DIV_R_N:
-      case OP_CMP_R_N:
-        tp_push(&tp, op == OP_ADD_R_N ? LABEL(L_ADD_R_N)
-                      : op == OP_SUB_R_N ? LABEL(L_SUB_R_N)
-                      : op == OP_MUL_R_N ? LABEL(L_MUL_R_N)
-                      : op == OP_DIV_R_N ? LABEL(L_DIV_R_N)
-                                          : LABEL(L_CMP_R_N));
-        tp_push(&tp, (uintptr_t)rd_u8(code, &pc, n));
-        tp_push(&tp, (uintptr_t)rd_u32(code, &pc, n));
-        break;
-
       case OP_ADD_R_R:
       case OP_SUB_R_R:
       case OP_MUL_R_R:
       case OP_DIV_R_R:
       case OP_CMP_R_R:
-        tp_push(&tp, op == OP_ADD_R_R ? LABEL(L_ADD_R_R)
-                      : op == OP_SUB_R_R ? LABEL(L_SUB_R_R)
-                      : op == OP_MUL_R_R ? LABEL(L_MUL_R_R)
-                      : op == OP_DIV_R_R ? LABEL(L_DIV_R_R)
-                                          : LABEL(L_CMP_R_R));
-        tp_push(&tp, (uintptr_t)rd_u8(code, &pc, n));
-        tp_push(&tp, (uintptr_t)rd_u8(code, &pc, n));
+        cell_count += 3;
+        break;
+      case OP_MOV_R_N:
+      case OP_ADD_R_N:
+      case OP_SUB_R_N:
+      case OP_MUL_R_N:
+      case OP_DIV_R_N:
+      case OP_CMP_R_N:
+        cell_count += 3;
+        break;
+      default:
+        break;
+    }
+
+    pc += sz;
+  }
+
+  byte_to_cell[n] = cell_count;
+
+  /* Pass 2: emit direct threaded cells */
+  pc = 0;
+  while (pc < n) {
+    uint8_t op = read_u8(code, &pc, n);
+    void *label = dispatch_table[op];
+    if (!label) {
+      fprintf(stderr, "opcode 0x%02X has no handler\n", op);
+      free(byte_to_cell);
+      free(cp.cells);
+      exit(1);
+    }
+
+    cp_push(&cp, (uintptr_t)label);
+
+    switch (op) {
+      case OP_HLT:
+      case OP_POP:
+      case OP_DUP:
+        break;
+
+      case OP_PUSH_N:
+        cp_push(&cp, (uintptr_t)read_u32(code, &pc, n));
+        break;
+
+      case OP_PUSH_R:
+      case OP_POP_R:
+        cp_push(&cp, (uintptr_t)read_u8(code, &pc, n));
+        break;
+
+      case OP_MOV_R_N:
+      case OP_ADD_R_N:
+      case OP_SUB_R_N:
+      case OP_MUL_R_N:
+      case OP_DIV_R_N:
+      case OP_CMP_R_N:
+        cp_push(&cp, (uintptr_t)read_u8(code, &pc, n));
+        cp_push(&cp, (uintptr_t)read_u32(code, &pc, n));
+        break;
+
+      case OP_MOV_R_R:
+      case OP_ADD_R_R:
+      case OP_SUB_R_R:
+      case OP_MUL_R_R:
+      case OP_DIV_R_R:
+      case OP_CMP_R_R:
+        cp_push(&cp, (uintptr_t)read_u8(code, &pc, n));
+        cp_push(&cp, (uintptr_t)read_u8(code, &pc, n));
         break;
 
       case OP_JMP_N:
       case OP_JEQ_N:
-      case OP_JNE_N:
-        tp_push(&tp, op == OP_JMP_N ? LABEL(L_JMP_N)
-                      : op == OP_JEQ_N ? LABEL(L_JEQ_N)
-                                       : LABEL(L_JNE_N));
-        tp_push(&tp, (uintptr_t)rd_u32(code, &pc, n));
+      case OP_JNE_N: {
+        uint32_t byte_target = read_u32(code, &pc, n);
+        if (byte_target > n || byte_to_cell[byte_target] == 0xFFFFFFFFu) {
+          fprintf(stderr, "invalid jump byte target: %u\n", byte_target);
+          free(byte_to_cell);
+          free(cp.cells);
+          exit(1);
+        }
+        cp_push(&cp, (uintptr_t)byte_to_cell[byte_target]);
         break;
+      }
 
       default:
-        fprintf(stderr, "unsupported opcode 0x%02X at byte pc=%zu\n", op, pc - 1);
-        free(tp.cells);
+        fprintf(stderr, "unsupported opcode during threading: 0x%02X\n", op);
+        free(byte_to_cell);
+        free(cp.cells);
         exit(1);
     }
   }
 
-  /* sentinel: إذا وصلنا نهاية stream بلا HLT نوقف التنفيذ */
-  tp_push(&tp, LABEL(L_HLT));
-  return tp;
-
-  /* Labels موجودة فقط لأخذ عناوينها أثناء threading */
-L_HLT:; L_PUSH_N:; L_PUSH_R:; L_POP:; L_POP_R:; L_DUP:;
-L_MOV_R_N:; L_MOV_R_R:;
-L_ADD_R_N:; L_ADD_R_R:; L_SUB_R_N:; L_SUB_R_R:;
-L_MUL_R_N:; L_MUL_R_R:; L_DIV_R_N:; L_DIV_R_R:;
-L_CMP_R_N:; L_CMP_R_R:;
-L_JMP_N:; L_JEQ_N:; L_JNE_N:;
-#undef LABEL
+  cp_push(&cp, (uintptr_t)dispatch_table[OP_HLT]);
+  free(byte_to_cell);
+  return cp;
 }
 
-static void vm_exec(FPVM *vm, ThreadedProgram *tp) {
-  uintptr_t *ip = tp->cells;
-#define DISPATCH() goto **(void **)ip++
+static void vm_exec(FPVM *vm, const uint8_t *code, size_t n) {
+  void *dispatch_table[256] = {0};
+  dispatch_table[OP_HLT] = &&L_HLT;
+  dispatch_table[OP_PUSH_N] = &&L_PUSH_N;
+  dispatch_table[OP_PUSH_R] = &&L_PUSH_R;
+  dispatch_table[OP_POP] = &&L_POP;
+  dispatch_table[OP_POP_R] = &&L_POP_R;
+  dispatch_table[OP_DUP] = &&L_DUP;
+  dispatch_table[OP_MOV_R_N] = &&L_MOV_R_N;
+  dispatch_table[OP_MOV_R_R] = &&L_MOV_R_R;
+  dispatch_table[OP_ADD_R_N] = &&L_ADD_R_N;
+  dispatch_table[OP_ADD_R_R] = &&L_ADD_R_R;
+  dispatch_table[OP_SUB_R_N] = &&L_SUB_R_N;
+  dispatch_table[OP_SUB_R_R] = &&L_SUB_R_R;
+  dispatch_table[OP_MUL_R_N] = &&L_MUL_R_N;
+  dispatch_table[OP_MUL_R_R] = &&L_MUL_R_R;
+  dispatch_table[OP_DIV_R_N] = &&L_DIV_R_N;
+  dispatch_table[OP_DIV_R_R] = &&L_DIV_R_R;
+  dispatch_table[OP_CMP_R_N] = &&L_CMP_R_N;
+  dispatch_table[OP_CMP_R_R] = &&L_CMP_R_R;
+  dispatch_table[OP_JMP_N] = &&L_JMP_N;
+  dispatch_table[OP_JEQ_N] = &&L_JEQ_N;
+  dispatch_table[OP_JNE_N] = &&L_JNE_N;
+
+  CellProgram cp = compile_to_direct_threaded(code, n, dispatch_table);
+
+  uintptr_t *ip = cp.cells;
+#define DISPATCH() goto *(void *)*ip++
 
   DISPATCH();
 
 L_HLT:
+  free(cp.cells);
   return;
 
-L_PUSH_N: {
-  if (vm->sp >= 1024) { fprintf(stderr, "stack overflow\n"); return; }
+L_PUSH_N:
+  if (vm->sp >= 1024) { fprintf(stderr, "stack overflow\n"); goto L_STOP; }
   vm->stack[vm->sp++] = (uint32_t)(*ip++);
   DISPATCH();
-}
 
 L_PUSH_R: {
   uint8_t r = (uint8_t)(*ip++);
-  if (vm->sp >= 1024) { fprintf(stderr, "stack overflow\n"); return; }
+  if (vm->sp >= 1024) { fprintf(stderr, "stack overflow\n"); goto L_STOP; }
   vm->stack[vm->sp++] = vm->regs[r];
   DISPATCH();
 }
 
-L_POP: {
-  if (vm->sp == 0) { fprintf(stderr, "stack underflow\n"); return; }
+L_POP:
+  if (vm->sp == 0) { fprintf(stderr, "stack underflow\n"); goto L_STOP; }
   vm->sp--;
   DISPATCH();
-}
 
 L_POP_R: {
   uint8_t r = (uint8_t)(*ip++);
-  if (vm->sp == 0) { fprintf(stderr, "stack underflow\n"); return; }
+  if (vm->sp == 0) { fprintf(stderr, "stack underflow\n"); goto L_STOP; }
   vm->regs[r] = vm->stack[--vm->sp];
   DISPATCH();
 }
 
-L_DUP: {
-  if (vm->sp == 0 || vm->sp >= 1024) { fprintf(stderr, "stack error\n"); return; }
+L_DUP:
+  if (vm->sp == 0 || vm->sp >= 1024) { fprintf(stderr, "stack error\n"); goto L_STOP; }
   vm->stack[vm->sp] = vm->stack[vm->sp - 1];
   vm->sp++;
   DISPATCH();
-}
 
 L_MOV_R_N: {
-  uint8_t r = (uint8_t)(*ip++);
-  vm->regs[r] = (uint32_t)(*ip++);
+  uint8_t dst = (uint8_t)(*ip++);
+  vm->regs[dst] = (uint32_t)(*ip++);
   DISPATCH();
 }
 
@@ -289,7 +385,7 @@ L_MUL_R_R: {
 L_DIV_R_N: {
   uint8_t r = (uint8_t)(*ip++);
   uint32_t imm = (uint32_t)(*ip++);
-  if (imm == 0) { fprintf(stderr, "division by zero\n"); return; }
+  if (imm == 0) { fprintf(stderr, "division by zero\n"); goto L_STOP; }
   vm->regs[r] /= imm;
   DISPATCH();
 }
@@ -297,16 +393,15 @@ L_DIV_R_N: {
 L_DIV_R_R: {
   uint8_t a = (uint8_t)(*ip++);
   uint8_t b = (uint8_t)(*ip++);
-  uint32_t d = vm->regs[b];
-  if (d == 0) { fprintf(stderr, "division by zero\n"); return; }
-  vm->regs[a] /= d;
+  if (vm->regs[b] == 0) { fprintf(stderr, "division by zero\n"); goto L_STOP; }
+  vm->regs[a] /= vm->regs[b];
   DISPATCH();
 }
 
 L_CMP_R_N: {
   uint8_t r = (uint8_t)(*ip++);
-  uint32_t v = (uint32_t)(*ip++);
-  vm->cmp_flag = (vm->regs[r] > v) - (vm->regs[r] < v);
+  uint32_t imm = (uint32_t)(*ip++);
+  vm->cmp_flag = (vm->regs[r] > imm) - (vm->regs[r] < imm);
   DISPATCH();
 }
 
@@ -318,29 +413,33 @@ L_CMP_R_R: {
 }
 
 L_JMP_N: {
-  uint32_t target = (uint32_t)(*ip++);
-  if (target >= tp->len) { fprintf(stderr, "bad jump target: %u\n", target); return; }
-  ip = tp->cells + target;
+  uint32_t target_cell = (uint32_t)(*ip++);
+  if (target_cell >= cp.len) { fprintf(stderr, "bad jump target cell=%u\n", target_cell); goto L_STOP; }
+  ip = cp.cells + target_cell;
   DISPATCH();
 }
 
 L_JEQ_N: {
-  uint32_t target = (uint32_t)(*ip++);
+  uint32_t target_cell = (uint32_t)(*ip++);
   if (vm->cmp_flag == 0) {
-    if (target >= tp->len) { fprintf(stderr, "bad jump target: %u\n", target); return; }
-    ip = tp->cells + target;
+    if (target_cell >= cp.len) { fprintf(stderr, "bad jump target cell=%u\n", target_cell); goto L_STOP; }
+    ip = cp.cells + target_cell;
   }
   DISPATCH();
 }
 
 L_JNE_N: {
-  uint32_t target = (uint32_t)(*ip++);
+  uint32_t target_cell = (uint32_t)(*ip++);
   if (vm->cmp_flag != 0) {
-    if (target >= tp->len) { fprintf(stderr, "bad jump target: %u\n", target); return; }
-    ip = tp->cells + target;
+    if (target_cell >= cp.len) { fprintf(stderr, "bad jump target cell=%u\n", target_cell); goto L_STOP; }
+    ip = cp.cells + target_cell;
   }
   DISPATCH();
 }
+
+L_STOP:
+  free(cp.cells);
+  return;
 
 #undef DISPATCH
 }
@@ -352,16 +451,6 @@ static void emit_u32(uint8_t *out, size_t *n, uint32_t v) {
   out[(*n)++] = (uint8_t)((v >> 24) & 0xFF);
 }
 
-/*
- * Demo bytecode:
- * r0 = 7
- * r1 = 5
- * r0 = r0 + r1
- * push r0; pop r2
- * cmp r2, 12
- * jeq -> set r3 = 1
- * hlt
- */
 int main(void) {
   uint8_t code[256] = {0};
   size_t n = 0;
@@ -373,44 +462,27 @@ int main(void) {
   code[n++] = OP_POP_R;   code[n++] = 2;
   code[n++] = OP_CMP_R_N; code[n++] = 2; emit_u32(code, &n, 12);
 
-  /* placeholder jump target in threaded-cell units */
   code[n++] = OP_JEQ_N;
-  size_t jeq_imm_pos = n;
-  emit_u32(code, &n, 0);
+  size_t jeq_target_pos = n;
+  emit_u32(code, &n, 0); /* patch لاحقاً */
 
   code[n++] = OP_MOV_R_N; code[n++] = 3; emit_u32(code, &n, 0);
   code[n++] = OP_HLT;
 
-  /* target block */
-  size_t equal_block_byte_pos = n;
+  uint32_t equal_block_pc = (uint32_t)n;
   code[n++] = OP_MOV_R_N; code[n++] = 3; emit_u32(code, &n, 1);
   code[n++] = OP_HLT;
 
-  ThreadedProgram tp = thread_bytecode(code, n);
-
-  /*
-   * نحسب target بصيغة cell-index داخل stream المبني (Direct Threaded Code).
-   * نبني prefix قبل equal-block لاستخراج عدد الخلايا.
-   */
-  ThreadedProgram prefix = thread_bytecode(code, equal_block_byte_pos);
-  uint32_t cell_target = (uint32_t)(prefix.len - 1); /* -1 لأن thread_bytecode يضيف sentinel HLT */
-  free(prefix.cells);
-
-  /* write jump cell target back into bytecode then rebuild */
-  code[jeq_imm_pos + 0] = (uint8_t)(cell_target & 0xFF);
-  code[jeq_imm_pos + 1] = (uint8_t)((cell_target >> 8) & 0xFF);
-  code[jeq_imm_pos + 2] = (uint8_t)((cell_target >> 16) & 0xFF);
-  code[jeq_imm_pos + 3] = (uint8_t)((cell_target >> 24) & 0xFF);
-
-  free(tp.cells);
-  tp = thread_bytecode(code, n);
+  code[jeq_target_pos + 0] = (uint8_t)(equal_block_pc & 0xFF);
+  code[jeq_target_pos + 1] = (uint8_t)((equal_block_pc >> 8) & 0xFF);
+  code[jeq_target_pos + 2] = (uint8_t)((equal_block_pc >> 16) & 0xFF);
+  code[jeq_target_pos + 3] = (uint8_t)((equal_block_pc >> 24) & 0xFF);
 
   FPVM vm = {0};
-  vm_exec(&vm, &tp);
+  vm_exec(&vm, code, n);
 
   printf("r0=%" PRIu32 ", r1=%" PRIu32 ", r2=%" PRIu32 ", r3=%" PRIu32 "\n",
          vm.regs[0], vm.regs[1], vm.regs[2], vm.regs[3]);
 
-  free(tp.cells);
   return 0;
 }
