@@ -13,3 +13,22 @@ FPVM — Phantom Virtual Machine
 ​Exception Handling: A robust interrupt system handles all errors, system calls, and signals, redirecting the execution flow to the Kernel's defined entry points.
 ​Register Mapping
 ​The architecture uses a large register file (1KB reserved), allowing for complex state management and dedicated registers for the PC (Program Counter), stack pointers for function calls, and value-tracking registers. The Kernel controls the V_DIRECTING_PROVINCE register, which acts as the gateway for all interrupts and error handling.
+
+## C Interpreter (Computed Goto + Direct Threaded Code)
+
+Added a C prototype at:
+
+- `/home/runner/work/PhantomVM/PhantomVM/fpvm_threaded.c`
+
+It demonstrates a basic FPVM-style interpreter using:
+
+- Computed Goto dispatch (no `switch-case` in execution loop)
+- Direct Threaded Code (`ip` jumps through handler addresses)
+- Basic instructions: halt, stack ops, move, arithmetic, compare, and conditional jump
+
+Build and run:
+
+```bash
+gcc -std=gnu11 -O2 /home/runner/work/PhantomVM/PhantomVM/fpvm_threaded.c -o /tmp/fpvm_threaded
+/tmp/fpvm_threaded
+```
