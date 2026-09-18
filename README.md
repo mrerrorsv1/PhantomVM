@@ -20,11 +20,11 @@ Added a C prototype at:
 
 - `/home/runner/work/PhantomVM/PhantomVM/fpvm_threaded.c`
 
-It demonstrates a basic FPVM-style interpreter using:
+It demonstrates a FPVM-style interpreter using:
 
 - Computed Goto dispatch (no `switch-case` in execution loop)
 - Direct Threaded Code (`ip` jumps through handler addresses)
-- Basic instructions: halt, stack ops, move, arithmetic, compare, and conditional jump
+- Full opcode coverage for the current instruction set in `constants.js` (0x00..0x7D), including stack/control-flow, memory/block ops, SIMD addx4/subx4, max/min, shifts, and system-related opcodes
 
 Build and run:
 
